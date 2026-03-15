@@ -65,40 +65,67 @@ def hdbscan_clusters(df, feature_cols, label_col, value_col, total_value, catego
     Returns a list of insights, one per discovered cluster, characterised by
     which features deviate most from the global mean — without any predefined
     pattern categories.
+
+    Improvements over v1:
+    - Uses fit() instead of fit_predict() to access probabilities_
+    - Uses soft membership probabilities to surface archetypal cluster members
+      (highest-probability = most representative) separately from top-by-clicks
+    - Filters low-confidence clusters (avg membership probability < 0.25)
+    - Computes outlier scores for noise points via distance to nearest cluster
+      centroid, separating extreme outliers from near-miss outliers
     """
     insights = []
     try:
         from sklearn.cluster import HDBSCAN
         from sklearn.preprocessing import StandardScaler
+        import numpy as np
 
         sub = df[feature_cols + [label_col, value_col]].dropna()
         if len(sub) < 15:
             return []
 
-        X = StandardScaler().fit_transform(sub[feature_cols].values)
+        scaler = StandardScaler()
+        X = scaler.fit_transform(sub[feature_cols].values)
+
         clusterer = HDBSCAN(min_cluster_size=5, min_samples=3)
-        labels = clusterer.fit_predict(X)
+        clusterer.fit(X)
+
+        labels = clusterer.labels_
+        probs  = clusterer.probabilities_   # soft membership [0,1] per point
+
         sub = sub.copy()
         sub["_cluster"] = labels
+        sub["_prob"]    = probs
 
         # Global means for comparison
         global_means = {col: float(sub[col].mean()) for col in feature_cols}
 
         unique_clusters = [c for c in sorted(sub["_cluster"].unique()) if c != -1]
-        if not unique_clusters:
-            return []
+
+        # Build cluster centroids (in scaled space) for outlier scoring later
+        cluster_centroids = {}
+        for cid in unique_clusters:
+            mask = labels == cid
+            cluster_centroids[cid] = X[mask].mean(axis=0)
 
         for cluster_id in unique_clusters:
-            mask = sub["_cluster"] == cluster_id
+            mask    = sub["_cluster"] == cluster_id
             cluster = sub[mask]
             cluster_clicks = float(cluster[value_col].sum())
-            cluster_size = int(mask.sum())
+            cluster_size   = int(mask.sum())
 
-            # Find top 3 most distinguishing features (largest z-score vs global)
+            # ── Confidence filter ──────────────────────────────────────────
+            # Low avg probability = cluster formed at a very tight density
+            # threshold and members aren't strongly assigned. Skip these.
+            avg_prob = float(cluster["_prob"].mean())
+            if avg_prob < 0.25:
+                continue
+
+            # ── Top 3 distinguishing features (largest |z-score|) ──────────
             deviations = []
             for col in feature_cols:
                 g_mean = global_means[col]
-                g_std = float(sub[col].std()) or 1.0
+                g_std  = float(sub[col].std()) or 1.0
                 c_mean = float(cluster[col].mean())
                 z = (c_mean - g_mean) / g_std
                 deviations.append((col, c_mean, g_mean, z))
@@ -106,13 +133,11 @@ def hdbscan_clusters(df, feature_cols, label_col, value_col, total_value, catego
             deviations.sort(key=lambda x: abs(x[3]), reverse=True)
             top_devs = deviations[:3]
 
-            # Build a plain-language description of what distinguishes this cluster
             trait_parts = []
             for col, c_mean, g_mean, z in top_devs:
                 if abs(z) < 0.3:
                     continue
                 direction = "high" if z > 0 else "low"
-                # Format value nicely based on column type
                 if "ctr" in col:
                     trait_parts.append(f"{direction} CTR ({c_mean*100:.2f}% vs {g_mean*100:.2f}% avg)")
                 elif "position" in col:
@@ -131,19 +156,34 @@ def hdbscan_clusters(df, feature_cols, label_col, value_col, total_value, catego
             if not trait_parts:
                 continue
 
-            trait_str = "; ".join(trait_parts) if trait_parts else "statistically distinct profile"
+            trait_str = "; ".join(trait_parts)
 
-            # Example members
-            examples = cluster.sort_values(value_col, ascending=False)[label_col].head(3).tolist()
+            # ── Archetypal members (highest soft membership probability) ───
+            # Most representative pages/queries in the cluster.
+            archetypal = (
+                cluster.sort_values("_prob", ascending=False)
+                .head(3)[label_col]
+                .tolist()
+            )
+            archetypal = [str(e).split("?")[0][:80] for e in archetypal]
+
+            # ── Top members by clicks ──────────────────────────────────────
+            examples = (
+                cluster.sort_values(value_col, ascending=False)
+                .head(3)[label_col]
+                .tolist()
+            )
             examples = [str(e).split("?")[0][:80] for e in examples]
 
             insights.append({
                 "category": category_tag,
                 "title": f"Discovered cluster of {cluster_size} {entity_name}: {trait_str[:80]}",
                 "description": (
-                    f"HDBSCAN found {cluster_size} {entity_name} that naturally group together with a distinct statistical profile. "
+                    f"HDBSCAN found {cluster_size} {entity_name} that naturally group together. "
                     f"Key traits vs site average: {trait_str}. "
-                    f"This cluster drives {cluster_clicks:.0f} of {total_value:.0f} total clicks ({cluster_clicks/total_value*100:.1f}%). "
+                    f"Cluster confidence (avg membership probability): {avg_prob:.0%}. "
+                    f"Drives {cluster_clicks:.0f} of {total_value:.0f} total clicks "
+                    f"({cluster_clicks / total_value * 100:.1f}%). "
                     f"No pattern was predefined — this grouping emerged purely from the data."
                 ),
                 "evidence": {
@@ -151,32 +191,94 @@ def hdbscan_clusters(df, feature_cols, label_col, value_col, total_value, catego
                     "cluster_size": cluster_size,
                     "cluster_clicks": round(cluster_clicks, 0),
                     "click_share_pct": round(cluster_clicks / total_value * 100, 1),
+                    "cluster_confidence_avg_prob": round(avg_prob, 3),
                     "distinguishing_features": [
-                        {"feature": col, "cluster_mean": round(c_mean, 4), "global_mean": round(g_mean, 4), "z_score": round(z, 2)}
+                        {
+                            "feature": col,
+                            "cluster_mean": round(c_mean, 4),
+                            "global_mean": round(g_mean, 4),
+                            "z_score": round(z, 2),
+                        }
                         for col, c_mean, g_mean, z in top_devs if abs(z) >= 0.3
                     ],
-                    "example_members": examples,
+                    "archetypal_members": archetypal,
+                    "top_members_by_clicks": examples,
                 },
                 "traffic_impact_score": min(1.0, cluster_clicks / total_value),
             })
 
-        # Also report noise points (cluster = -1) if significant
-        noise = sub[sub["_cluster"] == -1]
+        # ── Noise points: ranked by distance to nearest cluster centroid ───
+        # Points with no cluster assigned get an outlier score computed as
+        # their minimum Euclidean distance to any cluster centroid in scaled
+        # space. Higher distance = more anomalous / further from any group.
+        noise = sub[sub["_cluster"] == -1].copy()
         noise_clicks = float(noise[value_col].sum())
-        if len(noise) >= 5 and noise_clicks / total_value > 0.05:
+
+        if len(noise) >= 5 and noise_clicks / total_value > 0.02:
+            if cluster_centroids:
+                noise_indices = noise.index.tolist()
+                # Get scaled X rows for noise points
+                noise_X = X[sub.index.get_indexer(noise_indices)]
+                centroids_arr = np.array(list(cluster_centroids.values()))
+
+                # Distance from each noise point to its nearest centroid
+                distances = np.array([
+                    float(np.min(np.linalg.norm(centroids_arr - pt, axis=1)))
+                    for pt in noise_X
+                ])
+                noise = noise.copy()
+                noise["_dist"] = distances
+            else:
+                # No clusters formed — use distance from global centroid
+                global_centroid = X.mean(axis=0)
+                noise_indices = noise.index.tolist()
+                noise_X = X[sub.index.get_indexer(noise_indices)]
+                distances = np.array([float(np.linalg.norm(pt - global_centroid)) for pt in noise_X])
+                noise = noise.copy()
+                noise["_dist"] = distances
+
+            # Split at median: above = extreme outliers, below = near-miss
+            median_dist = float(noise["_dist"].median())
+            extreme  = noise[noise["_dist"] >= median_dist]
+            near_miss = noise[noise["_dist"] < median_dist]
+
+            top_extreme = (
+                extreme.sort_values("_dist", ascending=False)
+                .head(5)
+                .apply(
+                    lambda r: {
+                        "label": str(r[label_col]).split("?")[0][:80],
+                        "outlier_distance": round(float(r["_dist"]), 3),
+                        "clicks": int(r[value_col]),
+                    },
+                    axis=1,
+                )
+                .tolist()
+            )
+
             insights.append({
                 "category": category_tag,
-                "title": f"{len(noise)} {entity_name} don't fit any cluster — statistically unique",
+                "title": (
+                    f"{len(noise)} {entity_name} don't fit any cluster — "
+                    f"{len(extreme)} extreme outliers, {len(near_miss)} near-miss"
+                ),
                 "description": (
-                    f"HDBSCAN could not assign {len(noise)} {entity_name} to any cluster — they are statistical outliers "
-                    f"with no peers that share their profile. These represent {noise_clicks/total_value*100:.1f}% of total clicks. "
-                    f"Each is uniquely performing and worth individual review."
+                    f"HDBSCAN assigned {len(noise)} {entity_name} to noise (no cluster). "
+                    f"Scored by distance to nearest cluster centroid: "
+                    f"{len(extreme)} are extreme outliers (distance ≥ {median_dist:.2f}) with no statistical peers — "
+                    f"highest priority for individual review. "
+                    f"{len(near_miss)} are near-miss outliers that almost joined a cluster and may represent "
+                    f"an emerging pattern as the site grows. "
+                    f"Combined, they account for {noise_clicks / total_value * 100:.1f}% of total clicks."
                 ),
                 "evidence": {
-                    "noise_count": len(noise),
+                    "total_noise_count": len(noise),
+                    "extreme_outlier_count": len(extreme),
+                    "near_miss_count": len(near_miss),
                     "noise_clicks": round(noise_clicks, 0),
                     "click_share_pct": round(noise_clicks / total_value * 100, 1),
-                    "examples": noise.sort_values(value_col, ascending=False)[label_col].head(5).tolist(),
+                    "median_centroid_distance": round(median_dist, 3),
+                    "top_extreme_outliers": top_extreme,
                 },
                 "traffic_impact_score": min(1.0, noise_clicks / total_value * 0.5),
             })
