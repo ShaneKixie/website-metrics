@@ -70,6 +70,40 @@ function formatInsights(insights, site) {
     lines.push(`${ins.rank}. ${emoji} [${ins.category.toUpperCase()}] ${ins.title}`);
     lines.push(`   Traffic Impact: ${impact}%`);
     lines.push(`   ${ins.description}`);
+
+    // ── Surface evidence details for discovered_cluster insights ────────────
+    if (ins.category === "discovered_cluster" && ins.evidence) {
+      const ev = ins.evidence;
+
+      // Archetypal members (highest soft-membership probability = most representative)
+      if (ev.archetypal_members && ev.archetypal_members.length > 0) {
+        lines.push(`   Most representative members: ${ev.archetypal_members.join(" | ")}`);
+      }
+
+      // Top members by clicks (if different from archetypal)
+      if (
+        ev.top_members_by_clicks &&
+        ev.top_members_by_clicks.length > 0 &&
+        JSON.stringify(ev.top_members_by_clicks) !== JSON.stringify(ev.archetypal_members)
+      ) {
+        lines.push(`   Top by clicks: ${ev.top_members_by_clicks.join(" | ")}`);
+      }
+
+      // Extreme outliers breakdown (noise insights)
+      if (ev.extreme_outlier_count !== undefined) {
+        lines.push(
+          `   Breakdown: ${ev.extreme_outlier_count} extreme outliers (distance ≥ ${ev.median_centroid_distance}), ` +
+          `${ev.near_miss_count} near-miss outliers`
+        );
+        if (ev.top_extreme_outliers && ev.top_extreme_outliers.length > 0) {
+          lines.push(`   Top extreme outliers:`);
+          for (const o of ev.top_extreme_outliers) {
+            lines.push(`     • ${o.label} (outlier dist: ${o.outlier_distance}, clicks: ${o.clicks})`);
+          }
+        }
+      }
+    }
+
     lines.push("");
   }
 
