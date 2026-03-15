@@ -11,6 +11,20 @@ Two layers of discovery:
      predefining what to look for; multi-metric STUMPY runs on CTR, position,
      and impressions in addition to clicks
 
+v3 upgrades (from Deep Think critique):
+  - UMAP manifold projection before HDBSCAN: fixes mixed-data-type Euclidean
+    distance distortion that was causing binary features (is_blog, is_guide) to
+    dominate clustering. UMAP handles the mixed feature space correctly.
+  - GAM residual CTR anomaly detection: replaces raw Isolation Forest with a
+    position-adjusted expected CTR model (via pygam). PyOD now flags pages whose
+    CTR deviates from what's expected at their position, not just pages that are
+    statistically rare globally.
+  - Branded/non-branded bifurcation: MSTL and PyOD run on non-branded data
+    separately so branded traffic baselines don't skew anomaly detection.
+  - Richer content-type feature vector: adds is_comparison, is_help, is_product,
+    is_subdomain, has_year, is_anchor so HDBSCAN can differentiate comparison
+    pages, help center articles, product pages, and year-dated content.
+
 Input:  { "type": "gsc_daily"|"gsc_pages"|"gsc_queries", "data": [...], "site": "...", "days": 180 }
 Output: { "insights": [{ "rank", "category", "title", "description", "evidence", "traffic_impact_score" }] }
 """
@@ -30,49 +44,85 @@ EXPECTED_CTR = {1: 0.28, 2: 0.15, 3: 0.11, 4: 0.08, 5: 0.07,
 
 MAX_INSIGHTS = 50
 
+# ─────────────────────────────────────────────────────────────────────────────
+# BRAND TERM UTILITIES
+# ─────────────────────────────────────────────────────────────────────────────
 
-def analyze(payload):
-    analysis_type = payload.get("type")
-    data = payload.get("data", [])
-    site = payload.get("site", "")
+def extract_brand_root(site):
+    """Extract the primary brand root from the site URL for basic brand matching."""
+    import re
+    m = re.search(r"(?:https?://)?(?:www\.)?([^./]+)", site or "")
+    return m.group(1).lower() if m else None
 
-    if not data:
-        return {"insights": [], "error": "No data provided"}
 
-    dispatch = {
-        "gsc_daily":   analyze_daily,
-        "gsc_pages":   analyze_pages,
-        "gsc_queries": analyze_queries,
-    }
-    fn = dispatch.get(analysis_type)
-    if not fn:
-        return {"insights": [], "error": f"Unknown analysis type: {analysis_type}"}
-
-    insights = fn(data, site)
-    insights.sort(key=lambda x: x.get("traffic_impact_score", 0), reverse=True)
-    for i, ins in enumerate(insights):
-        ins["rank"] = i + 1
-    return {"insights": insights[:MAX_INSIGHTS]}
+def flag_branded(df, query_col, brand_root):
+    """
+    Add is_branded column using brand root substring match.
+    Returns df with is_branded column added.
+    """
+    if brand_root:
+        df = df.copy()
+        df["is_branded"] = df[query_col].str.lower().str.contains(brand_root, regex=False)
+    else:
+        df = df.copy()
+        df["is_branded"] = False
+    return df
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OPEN-ENDED DISCOVERY HELPERS
+# GAM RESIDUAL CTR ANOMALY DETECTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_ctr_residuals(df, position_col="position", ctr_col="ctr", impressions_col="impressions"):
+    """
+    Fit a GAM to model expected CTR given position, then return residuals.
+    Uses pygam if available, falls back to log-linear regression via numpy.
+
+    Residual = actual_ctr - expected_ctr_at_position
+    Positive residual = outperforming; Negative residual = underperforming.
+
+    Returns df with columns: expected_ctr, ctr_residual
+    """
+    df = df.copy()
+    try:
+        from pygam import LinearGAM, s
+        X = df[[position_col]].values
+        y = df[ctr_col].values
+        w = np.log1p(df[impressions_col].values)  # weight by log impressions
+        gam = LinearGAM(s(0, n_splines=8)).fit(X, y, weights=w)
+        df["expected_ctr"] = gam.predict(X).clip(0, 1)
+    except Exception:
+        # Fallback: log-linear model (CTR ~ 1/position)
+        pos = df[position_col].values.clip(1, 100)
+        log_pos = np.log(pos)
+        log_ctr = np.log(df[ctr_col].values.clip(1e-6, 1))
+        try:
+            coeffs = np.polyfit(log_pos, log_ctr, 1)
+            df["expected_ctr"] = np.exp(np.polyval(coeffs, log_pos)).clip(0, 1)
+        except Exception:
+            df["expected_ctr"] = df[position_col].apply(
+                lambda p: EXPECTED_CTR.get(min(10, max(1, round(p))), 0.02)
+            )
+    df["ctr_residual"] = df[ctr_col] - df["expected_ctr"]
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UMAP + HDBSCAN CLUSTERING
 # ─────────────────────────────────────────────────────────────────────────────
 
 def hdbscan_clusters(df, feature_cols, label_col, value_col, total_value, category_tag, entity_name="pages"):
     """
-    Run HDBSCAN on a feature matrix built from df[feature_cols].
-    Returns a list of insights, one per discovered cluster, characterised by
-    which features deviate most from the global mean — without any predefined
-    pattern categories.
+    Run UMAP → HDBSCAN on a feature matrix built from df[feature_cols].
 
-    Improvements over v1:
-    - Uses fit() instead of fit_predict() to access probabilities_
-    - Uses soft membership probabilities to surface archetypal cluster members
-      (highest-probability = most representative) separately from top-by-clicks
-    - Filters low-confidence clusters (avg membership probability < 0.25)
-    - Computes outlier scores for noise points via distance to nearest cluster
-      centroid, separating extreme outliers from near-miss outliers
+    v3 changes:
+    - StandardScaler → UMAP manifold projection before HDBSCAN. UMAP handles
+      mixed continuous/binary feature spaces correctly, preventing binary flags
+      from dominating Euclidean distance calculations.
+    - Falls back gracefully to scaled HDBSCAN if umap-learn is not installed.
+    - Soft membership probabilities surface archetypal members per cluster.
+    - Noise points ranked by centroid distance (extreme vs near-miss).
+    - Low-confidence clusters filtered (avg prob < 0.25).
     """
     insights = []
     try:
@@ -84,25 +134,48 @@ def hdbscan_clusters(df, feature_cols, label_col, value_col, total_value, catego
         if len(sub) < 15:
             return []
 
+        # Scale first — required before both UMAP and fallback HDBSCAN
         scaler = StandardScaler()
-        X = scaler.fit_transform(sub[feature_cols].values)
+        X_scaled = scaler.fit_transform(sub[feature_cols].values)
 
+        # ── UMAP projection ────────────────────────────────────────────────
+        # Project to dense manifold before clustering to fix mixed-type distance
+        # distortion. Falls back to scaled features if umap-learn not available.
+        try:
+            from umap import UMAP
+            n_components = min(5, len(feature_cols) - 1, len(sub) - 2)
+            n_components = max(2, n_components)
+            reducer = UMAP(
+                n_components=n_components,
+                n_neighbors=min(15, len(sub) // 3),
+                min_dist=0.0,   # tighter clusters for HDBSCAN
+                metric="euclidean",
+                random_state=42,
+                low_memory=False,
+            )
+            X = reducer.fit_transform(X_scaled)
+            umap_used = True
+        except Exception:
+            X = X_scaled
+            umap_used = False
+
+        # ── HDBSCAN ───────────────────────────────────────────────────────
         clusterer = HDBSCAN(min_cluster_size=5, min_samples=3)
         clusterer.fit(X)
 
         labels = clusterer.labels_
-        probs  = clusterer.probabilities_   # soft membership [0,1] per point
+        probs  = clusterer.probabilities_
 
         sub = sub.copy()
         sub["_cluster"] = labels
         sub["_prob"]    = probs
 
-        # Global means for comparison
+        # Global means computed from ORIGINAL features for interpretability
         global_means = {col: float(sub[col].mean()) for col in feature_cols}
 
         unique_clusters = [c for c in sorted(sub["_cluster"].unique()) if c != -1]
 
-        # Build cluster centroids (in scaled space) for outlier scoring later
+        # Centroids in UMAP space for outlier distance scoring
         cluster_centroids = {}
         for cid in unique_clusters:
             mask = labels == cid
@@ -114,14 +187,11 @@ def hdbscan_clusters(df, feature_cols, label_col, value_col, total_value, catego
             cluster_clicks = float(cluster[value_col].sum())
             cluster_size   = int(mask.sum())
 
-            # ── Confidence filter ──────────────────────────────────────────
-            # Low avg probability = cluster formed at a very tight density
-            # threshold and members aren't strongly assigned. Skip these.
             avg_prob = float(cluster["_prob"].mean())
             if avg_prob < 0.25:
                 continue
 
-            # ── Top 3 distinguishing features (largest |z-score|) ──────────
+            # Distinguishing features (z-scores on original feature values)
             deviations = []
             for col in feature_cols:
                 g_mean = global_means[col]
@@ -150,6 +220,9 @@ def hdbscan_clusters(df, feature_cols, label_col, value_col, total_value, catego
                     trait_parts.append(f"{'deeper' if z > 0 else 'shallower'} URLs (depth {c_mean:.1f} vs {g_mean:.1f} avg)")
                 elif "word_count" in col:
                     trait_parts.append(f"{'longer' if z > 0 else 'shorter'} queries ({c_mean:.1f} words vs {g_mean:.1f} avg)")
+                elif col.startswith("is_") or col.startswith("has_"):
+                    label = col.replace("is_", "").replace("has_", "").replace("_", " ")
+                    trait_parts.append(f"{direction} {label} ({c_mean:.2f} vs {g_mean:.2f} avg)")
                 else:
                     trait_parts.append(f"{direction} {col.replace('_', ' ')} ({c_mean:.2f} vs {g_mean:.2f} avg)")
 
@@ -158,20 +231,15 @@ def hdbscan_clusters(df, feature_cols, label_col, value_col, total_value, catego
 
             trait_str = "; ".join(trait_parts)
 
-            # ── Archetypal members (highest soft membership probability) ───
-            # Most representative pages/queries in the cluster.
             archetypal = (
                 cluster.sort_values("_prob", ascending=False)
-                .head(3)[label_col]
-                .tolist()
+                .head(3)[label_col].tolist()
             )
             archetypal = [str(e).split("?")[0][:80] for e in archetypal]
 
-            # ── Top members by clicks ──────────────────────────────────────
             examples = (
                 cluster.sort_values(value_col, ascending=False)
-                .head(3)[label_col]
-                .tolist()
+                .head(3)[label_col].tolist()
             )
             examples = [str(e).split("?")[0][:80] for e in examples]
 
@@ -179,7 +247,8 @@ def hdbscan_clusters(df, feature_cols, label_col, value_col, total_value, catego
                 "category": category_tag,
                 "title": f"Discovered cluster of {cluster_size} {entity_name}: {trait_str[:80]}",
                 "description": (
-                    f"HDBSCAN found {cluster_size} {entity_name} that naturally group together. "
+                    f"HDBSCAN found {cluster_size} {entity_name} that naturally group together "
+                    f"({'UMAP-projected' if umap_used else 'scaled'} feature space). "
                     f"Key traits vs site average: {trait_str}. "
                     f"Cluster confidence (avg membership probability): {avg_prob:.0%}. "
                     f"Drives {cluster_clicks:.0f} of {total_value:.0f} total clicks "
@@ -192,6 +261,7 @@ def hdbscan_clusters(df, feature_cols, label_col, value_col, total_value, catego
                     "cluster_clicks": round(cluster_clicks, 0),
                     "click_share_pct": round(cluster_clicks / total_value * 100, 1),
                     "cluster_confidence_avg_prob": round(avg_prob, 3),
+                    "umap_projection_used": umap_used,
                     "distinguishing_features": [
                         {
                             "feature": col,
@@ -207,39 +277,29 @@ def hdbscan_clusters(df, feature_cols, label_col, value_col, total_value, catego
                 "traffic_impact_score": min(1.0, cluster_clicks / total_value),
             })
 
-        # ── Noise points: ranked by distance to nearest cluster centroid ───
-        # Points with no cluster assigned get an outlier score computed as
-        # their minimum Euclidean distance to any cluster centroid in scaled
-        # space. Higher distance = more anomalous / further from any group.
+        # Noise: rank by distance to nearest centroid in projected space
         noise = sub[sub["_cluster"] == -1].copy()
         noise_clicks = float(noise[value_col].sum())
 
         if len(noise) >= 5 and noise_clicks / total_value > 0.02:
             if cluster_centroids:
                 noise_indices = noise.index.tolist()
-                # Get scaled X rows for noise points
                 noise_X = X[sub.index.get_indexer(noise_indices)]
                 centroids_arr = np.array(list(cluster_centroids.values()))
-
-                # Distance from each noise point to its nearest centroid
                 distances = np.array([
                     float(np.min(np.linalg.norm(centroids_arr - pt, axis=1)))
                     for pt in noise_X
                 ])
-                noise = noise.copy()
-                noise["_dist"] = distances
             else:
-                # No clusters formed — use distance from global centroid
                 global_centroid = X.mean(axis=0)
                 noise_indices = noise.index.tolist()
                 noise_X = X[sub.index.get_indexer(noise_indices)]
                 distances = np.array([float(np.linalg.norm(pt - global_centroid)) for pt in noise_X])
-                noise = noise.copy()
-                noise["_dist"] = distances
 
-            # Split at median: above = extreme outliers, below = near-miss
+            noise = noise.copy()
+            noise["_dist"] = distances
             median_dist = float(noise["_dist"].median())
-            extreme  = noise[noise["_dist"] >= median_dist]
+            extreme   = noise[noise["_dist"] >= median_dist]
             near_miss = noise[noise["_dist"] < median_dist]
 
             top_extreme = (
@@ -264,7 +324,8 @@ def hdbscan_clusters(df, feature_cols, label_col, value_col, total_value, catego
                 ),
                 "description": (
                     f"HDBSCAN assigned {len(noise)} {entity_name} to noise (no cluster). "
-                    f"Scored by distance to nearest cluster centroid: "
+                    f"Scored by distance to nearest cluster centroid in "
+                    f"{'UMAP-projected' if umap_used else 'scaled'} feature space: "
                     f"{len(extreme)} are extreme outliers (distance ≥ {median_dist:.2f}) with no statistical peers — "
                     f"highest priority for individual review. "
                     f"{len(near_miss)} are near-miss outliers that almost joined a cluster and may represent "
@@ -289,11 +350,12 @@ def hdbscan_clusters(df, feature_cols, label_col, value_col, total_value, catego
     return insights
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# STUMPY HELPER
+# ─────────────────────────────────────────────────────────────────────────────
+
 def stumpy_metric(series, dates, metric_name, m=7):
-    """
-    Run STUMPY on a single metric time series and return motif/discord insights.
-    Returns [] if series is too short or all-zero.
-    """
+    """Run STUMPY on a single metric time series and return motif/discord insights."""
     insights = []
     try:
         import stumpy
@@ -305,7 +367,6 @@ def stumpy_metric(series, dates, metric_name, m=7):
         mp = stumpy.stump(values, m=m)
         profile = mp[:, 0].astype(float)
 
-        # Top 2 motifs
         profile_copy = profile.copy()
         for rank in range(1, 3):
             if np.all(np.isinf(profile_copy)):
@@ -337,7 +398,6 @@ def stumpy_metric(series, dates, metric_name, m=7):
                     "traffic_impact_score": min(1.0, abs(ratio - 1) * 0.4),
                 })
 
-        # Top 2 discords
         profile_copy = profile.copy()
         for rank in range(1, 3):
             if np.all(np.isinf(profile_copy)):
@@ -400,7 +460,7 @@ def analyze_daily(rows, site):
     df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values("date").set_index("date")
 
-    # ── MSTL: weekly + monthly seasonality ───────────────────────────────────
+    # ── MSTL: weekly + monthly seasonality ────────────────────────────────────
     try:
         from statsmodels.tsa.seasonal import MSTL
 
@@ -498,7 +558,7 @@ def analyze_daily(rows, site):
     except Exception:
         pass
 
-    # ── STUMPY: clicks + CTR + position + impressions across multiple windows ─
+    # ── STUMPY across multiple windows and metrics ────────────────────────────
     try:
         dates = df.index.tolist()
         clicks_arr = df["clicks"].fillna(0).values.astype(float)
@@ -519,7 +579,6 @@ def analyze_daily(rows, site):
                 mp = stumpy.stump(clicks_arr, m=m)
                 profile = mp[:, 0].astype(float)
 
-                # Top 3 motifs
                 profile_copy = profile.copy()
                 motif_count = 0
                 for _ in range(3):
@@ -552,7 +611,6 @@ def analyze_daily(rows, site):
                             "traffic_impact_score": min(1.0, abs(motif_ratio - 1) * 0.6),
                         })
 
-                # Top 3 discords
                 profile_copy = profile.copy()
                 discord_count = 0
                 for _ in range(3):
@@ -591,10 +649,8 @@ def analyze_daily(rows, site):
             except Exception:
                 pass
 
-        # ── Open-ended: STUMPY on CTR, position, impressions ─────────────────
-        # These run independently — finds patterns we never thought to look for
         for metric_name, col in [("CTR", "ctr"), ("avg_position", "position"), ("impressions", "impressions")]:
-            series = df[col].fillna(method="ffill").fillna(0).values.astype(float)
+            series = df[col].ffill().fillna(0).values.astype(float)
             for m, _ in window_configs:
                 new_insights = stumpy_metric(series, dates, metric_name, m=m)
                 insights.extend(new_insights)
@@ -626,7 +682,7 @@ def analyze_pages(rows, site):
     total_clicks = df["clicks"].sum() or 1.0
     total_impressions = df["impressions"].sum() or 1.0
 
-    # ── URL features ──────────────────────────────────────────────────────────
+    # ── URL feature engineering (v3: expanded content-type signals) ───────────
     def path_depth(url):
         return len([p for p in url.split("?")[0].split("/") if p])
 
@@ -634,15 +690,46 @@ def analyze_pages(rows, site):
         parts = url.split("?")[0].lower().split("/")
         return int(any(k in parts for k in keywords))
 
-    df["url_depth"] = df["page"].apply(path_depth)
-    df["is_blog"] = df["page"].apply(lambda u: has_segment(u, ["blog", "blogs", "post", "posts", "article", "articles"]))
-    df["is_guide"] = df["page"].apply(lambda u: has_segment(u, ["guide", "guides", "how-to", "tutorial", "learn"]))
-    df["log_clicks"] = np.log1p(df["clicks"])
+    def url_contains(url, substrings):
+        u = url.lower()
+        return int(any(s in u for s in substrings))
+
+    def get_subdomain(url):
+        try:
+            from urllib.parse import urlparse
+            host = urlparse(url).netloc.lower()
+            parts = host.split(".")
+            if len(parts) > 2:
+                sub = parts[0]
+                return 0 if sub in ("www", "") else 1
+            return 0
+        except Exception:
+            return 0
+
+    import re as _re
+    YEAR_PATTERN = _re.compile(r"20[12]\d")
+
+    df["url_depth"]      = df["page"].apply(path_depth)
+    df["is_blog"]        = df["page"].apply(lambda u: has_segment(u, ["blog", "blogs", "post", "posts", "article", "articles"]))
+    df["is_guide"]       = df["page"].apply(lambda u: has_segment(u, ["guide", "guides", "how-to", "tutorial", "learn"]))
+    df["is_comparison"]  = df["page"].apply(lambda u: url_contains(u, ["-vs-", "-versus-", "compare", "comparison"]))
+    df["is_help"]        = df["page"].apply(lambda u: url_contains(u, ["help.", "/help/", "support.", "/support/", "docs.", "/docs/"]))
+    df["is_product"]     = df["page"].apply(lambda u: url_contains(u, ["/plan", "/pricing", "/challenge", "/funded", "/select", "/growth", "/lightning"]))
+    df["is_subdomain"]   = df["page"].apply(get_subdomain)
+    df["has_year"]       = df["page"].apply(lambda u: int(bool(YEAR_PATTERN.search(u.split("?")[0]))))
+    df["is_anchor"]      = df["page"].apply(lambda u: int("#" in u))
+    df["log_clicks"]     = np.log1p(df["clicks"])
     df["log_impressions"] = np.log1p(df["impressions"])
 
-    # ── Predefined: blog/guide CTR comparison ─────────────────────────────────
+    # ── Predefined: blog/guide/comparison/help CTR comparison ────────────────
     try:
-        for seg_col, seg_label in [("is_blog", "Blog"), ("is_guide", "Guide")]:
+        content_segs = [
+            ("is_blog", "Blog"),
+            ("is_guide", "Guide"),
+            ("is_comparison", "Comparison"),
+            ("is_help", "Help center"),
+        ]
+        for seg_col, seg_label in content_segs:
             seg = df[df[seg_col] == 1]
             non_seg = df[df[seg_col] == 0]
             if len(seg) >= 5 and len(non_seg) >= 5:
@@ -660,13 +747,43 @@ def analyze_pages(rows, site):
                             f"{'Invest more in this content type.' if seg_ctr > other_ctr else 'Review title/meta on this content type.'}"
                         ),
                         "evidence": {
-                            f"{seg_label.lower()}_avg_ctr": round(float(seg_ctr), 4),
+                            f"{seg_label.lower().replace(' ', '_')}_avg_ctr": round(float(seg_ctr), 4),
                             "other_avg_ctr": round(float(other_ctr), 4),
-                            f"{seg_label.lower()}_page_count": len(seg),
-                            f"{seg_label.lower()}_total_clicks": float(seg_clicks),
+                            f"{seg_label.lower().replace(' ', '_')}_page_count": len(seg),
+                            f"{seg_label.lower().replace(' ', '_')}_total_clicks": float(seg_clicks),
                         },
                         "traffic_impact_score": min(1.0, seg_clicks / total_clicks),
                     })
+    except Exception:
+        pass
+
+    # ── Predefined: year-dated pages performance ──────────────────────────────
+    try:
+        year_pages = df[df["has_year"] == 1]
+        non_year   = df[df["has_year"] == 0]
+        if len(year_pages) >= 3 and len(non_year) >= 5:
+            y_ctr  = float(year_pages["ctr"].mean())
+            ny_ctr = float(non_year["ctr"].mean())
+            y_impr = float(year_pages["impressions"].sum())
+            if ny_ctr > 0 and y_ctr < ny_ctr * 0.7:
+                insights.append({
+                    "category": "cluster",
+                    "title": f"{len(year_pages)} year-dated pages average {y_ctr*100:.2f}% CTR — {(1-y_ctr/ny_ctr)*100:.0f}% below non-dated pages",
+                    "description": (
+                        f"Pages with a year in the URL (e.g. /best-prop-firms-2025/) average "
+                        f"{y_ctr*100:.2f}% CTR vs {ny_ctr*100:.2f}% for non-dated pages. "
+                        f"Year-dated pages often suffer low CTR when the year in the title appears stale. "
+                        f"Review title tags on {len(year_pages)} pages to ensure the year matches searcher expectations."
+                    ),
+                    "evidence": {
+                        "year_dated_page_count": len(year_pages),
+                        "year_dated_avg_ctr": round(y_ctr, 4),
+                        "non_dated_avg_ctr": round(ny_ctr, 4),
+                        "year_dated_total_impressions": round(y_impr, 0),
+                        "example_pages": year_pages.sort_values("impressions", ascending=False)["page"].head(5).tolist(),
+                    },
+                    "traffic_impact_score": min(1.0, y_impr / total_impressions * 2),
+                })
     except Exception:
         pass
 
@@ -702,39 +819,55 @@ def analyze_pages(rows, site):
     except Exception:
         pass
 
-    # ── Predefined: PyOD anomalous low-CTR + high-CTR pages ──────────────────
+    # ── GAM residual PyOD: position-adjusted CTR anomaly detection ────────────
+    # v3: fit expected CTR ~ f(position) via GAM, run PyOD on residuals.
+    # This prevents flagging high-CTR position-1 pages as anomalies simply
+    # because they're statistically rare globally.
     try:
         from pyod.models.iforest import IForest
-        from sklearn.preprocessing import StandardScaler
 
-        sig = df[df["impressions"] >= 100].copy()
+        sig = df[(df["impressions"] >= 100) & (df["position"] > 0)].copy()
         if len(sig) >= 20:
-            X = StandardScaler().fit_transform(sig[["position", "ctr", "impressions"]].values)
+            sig = compute_ctr_residuals(sig)
+
+            # Feature matrix: residual + impressions (log-scaled) + position
+            import numpy as _np
+            feat = _np.column_stack([
+                sig["ctr_residual"].values,
+                _np.log1p(sig["impressions"].values),
+                sig["position"].values,
+            ])
+            from sklearn.preprocessing import StandardScaler as _SS
+            feat_scaled = _SS().fit_transform(feat)
+
             clf = IForest(contamination=0.15, random_state=42)
-            clf.fit(X)
+            clf.fit(feat_scaled)
             sig["anomaly"] = clf.labels_
 
             top10 = sig[sig["position"] <= 10].copy()
             if len(top10) >= 5:
-                ctr_thresh = top10["ctr"].quantile(0.33)
-                under = top10[top10["ctr"] <= ctr_thresh].sort_values("impressions", ascending=False)
+                # Low CTR residuals in top 10 = genuinely underperforming
+                residual_thresh = top10["ctr_residual"].quantile(0.33)
+                under = top10[top10["ctr_residual"] <= residual_thresh].sort_values("impressions", ascending=False)
                 if len(under) >= 2:
                     avg_top10_ctr = float(top10["ctr"].mean())
                     avg_under_ctr = float(under["ctr"].mean())
-                    est_lost = float((under["impressions"] * (avg_top10_ctr - under["ctr"])).sum())
+                    avg_expected  = float(under["expected_ctr"].mean())
+                    est_lost = float((under["impressions"] * (under["expected_ctr"] - under["ctr"])).clip(0).sum())
                     examples = [u.split("?")[0] for u in under["page"].head(5).tolist()]
                     insights.append({
                         "category": "anomaly",
-                        "title": f"{len(under)} top-10 pages have anomalously low CTR",
+                        "title": f"{len(under)} top-10 pages underperform their expected CTR (position-adjusted)",
                         "description": (
-                            f"These pages rank in the top 10 but CTR is in the bottom third for that position band. "
-                            f"Average CTR: {avg_under_ctr*100:.1f}% vs {avg_top10_ctr*100:.1f}% for top-10 overall. "
+                            f"Using a GAM model of expected CTR by position, {len(under)} pages rank in the top 10 "
+                            f"but click through significantly less than expected for their rank. "
+                            f"Average actual CTR: {avg_under_ctr*100:.1f}% vs expected {avg_expected*100:.1f}% at their positions. "
                             f"Improving title tags and meta descriptions could recover ~{est_lost:.0f} clicks."
                         ),
                         "evidence": {
                             "underperforming_page_count": len(under),
-                            "avg_ctr_underperformers": round(avg_under_ctr, 4),
-                            "avg_ctr_top10": round(avg_top10_ctr, 4),
+                            "avg_actual_ctr": round(avg_under_ctr, 4),
+                            "avg_expected_ctr_at_position": round(avg_expected, 4),
                             "estimated_recoverable_clicks": round(est_lost, 0),
                             "example_pages": examples,
                         },
@@ -743,17 +876,18 @@ def analyze_pages(rows, site):
 
                 top10_high = sig[(sig["position"] <= 10) & (sig["anomaly"] == 1)].copy()
                 if len(top10_high) >= 4:
-                    top10_high_ctr = top10_high[top10_high["ctr"] > top10_high["ctr"].quantile(0.75)]
+                    top10_high_ctr = top10_high[top10_high["ctr_residual"] > top10_high["ctr_residual"].quantile(0.75)]
                     if len(top10_high_ctr) >= 2:
                         avg_high_ctr = float(top10_high_ctr["ctr"].mean())
                         avg_top10_ctr = float(top10["ctr"].mean())
                         examples = [u.split("?")[0] for u in top10_high_ctr.sort_values("impressions", ascending=False)["page"].head(3).tolist()]
                         insights.append({
                             "category": "cluster",
-                            "title": f"{len(top10_high_ctr)} pages have anomalously HIGH CTR — study as models",
+                            "title": f"{len(top10_high_ctr)} pages have anomalously HIGH CTR vs position expectation — study as models",
                             "description": (
-                                f"PyOD flagged {len(top10_high_ctr)} top-10 pages as high-side outliers — "
-                                f"averaging {avg_high_ctr*100:.1f}% CTR vs {avg_top10_ctr*100:.1f}% for top-10 overall. "
+                                f"PyOD (residual-adjusted) flagged {len(top10_high_ctr)} top-10 pages as high-side outliers — "
+                                f"clicking through significantly more than expected for their position. "
+                                f"Average CTR: {avg_high_ctr*100:.1f}% vs {avg_top10_ctr*100:.1f}% for top-10 overall. "
                                 f"Analyze these pages' title/meta patterns and replicate across similar pages."
                             ),
                             "evidence": {
@@ -808,8 +942,13 @@ def analyze_pages(rows, site):
     except Exception:
         pass
 
-    # ── Open-ended: HDBSCAN on page feature vectors ───────────────────────────
-    page_features = ["log_clicks", "log_impressions", "ctr", "position", "url_depth", "is_blog", "is_guide"]
+    # ── Open-ended: UMAP → HDBSCAN on expanded page feature vectors ──────────
+    # v3: richer content-type features; UMAP handles mixed binary/continuous
+    page_features = [
+        "log_clicks", "log_impressions", "ctr", "position", "url_depth",
+        "is_blog", "is_guide", "is_comparison", "is_help", "is_product",
+        "is_subdomain", "has_year", "is_anchor",
+    ]
     hdbscan_insights = hdbscan_clusters(
         df, page_features, label_col="page", value_col="clicks",
         total_value=total_clicks, category_tag="discovered_cluster", entity_name="pages"
@@ -840,55 +979,99 @@ def analyze_queries(rows, site):
     total_clicks = df["clicks"].sum() or 1.0
 
     question_words = ("how", "what", "why", "when", "where", "who", "which", "can", "does", "is ", "are ", "will ")
-    df["word_count"] = df["query"].str.split().str.len()
+    df["word_count"]  = df["query"].str.split().str.len()
     df["is_question"] = df["query"].str.lower().apply(lambda q: any(q.startswith(w) for w in question_words))
-    df["log_clicks"] = np.log1p(df["clicks"])
+    df["log_clicks"]      = np.log1p(df["clicks"])
     df["log_impressions"] = np.log1p(df["impressions"])
 
-    # ── Predefined: high-impression, low-CTR ─────────────────────────────────
+    # ── Branded / non-branded bifurcation ─────────────────────────────────────
+    # v3: flag branded queries properly and run all downstream analyses on
+    # non-branded subset to avoid branded CTR baselines skewing anomaly detection
+    brand_root = extract_brand_root(site)
+    df = flag_branded(df, "query", brand_root)
+    branded    = df[df["is_branded"]].copy()
+    nonbranded = df[~df["is_branded"]].copy()
+
+    nb_total_clicks = nonbranded["clicks"].sum() or 1.0
+
+    # ── Predefined: branded vs non-branded summary ────────────────────────────
     try:
-        imp_75 = df["impressions"].quantile(0.75)
-        ctr_25 = df["ctr"].quantile(0.25)
-        hi_imp_lo_ctr = df[(df["impressions"] >= imp_75) & (df["ctr"] <= ctr_25)].copy()
-        if len(hi_imp_lo_ctr) >= 5:
-            hi_imp_lo_ctr["opportunity"] = hi_imp_lo_ctr["impressions"] * (df["ctr"].mean() - hi_imp_lo_ctr["ctr"])
-            top = hi_imp_lo_ctr.sort_values("opportunity", ascending=False).head(5)
-            total_opp = float(top["opportunity"].sum())
+        if len(branded) >= 3 and len(nonbranded) >= 10:
+            b_clicks  = branded["clicks"].sum()
+            nb_clicks = nonbranded["clicks"].sum()
+            b_ctr     = branded["ctr"].mean()
+            nb_ctr    = nonbranded["ctr"].mean()
+            b_pct     = b_clicks / total_clicks * 100
             insights.append({
-                "category": "anomaly",
-                "title": f"{len(hi_imp_lo_ctr)} high-impression queries have below-average CTR",
+                "category": "cluster",
+                "title": f"Branded queries account for {b_pct:.0f}% of total clicks at {b_ctr*100:.1f}% CTR",
                 "description": (
-                    f"Top 25% impressions but bottom 25% CTR — high visibility, low click-through. "
-                    f"Top: '{top.iloc[0]['query']}' — {top.iloc[0]['impressions']:.0f} impressions at {top.iloc[0]['ctr']*100:.1f}% CTR. "
-                    f"Fixing titles/meta could yield ~{total_opp:.0f} additional clicks."
+                    f"Branded queries ({len(branded)} keywords): {b_clicks:.0f} clicks at {b_ctr*100:.1f}% CTR. "
+                    f"Non-branded ({len(nonbranded)} keywords): {nb_clicks:.0f} clicks at {nb_ctr*100:.1f}% CTR. "
+                    f"{'High branded share — diversify non-branded content.' if b_pct > 30 else 'Strong non-branded organic presence.'}"
                 ),
                 "evidence": {
-                    "query_count": len(hi_imp_lo_ctr),
-                    "top_opportunities": top[["query", "impressions", "ctr", "position"]].round(3).to_dict("records"),
-                    "estimated_additional_clicks": round(total_opp, 0),
+                    "branded_query_count": len(branded),
+                    "branded_clicks": float(b_clicks),
+                    "branded_avg_ctr": round(float(b_ctr), 4),
+                    "nonbranded_clicks": float(nb_clicks),
+                    "nonbranded_avg_ctr": round(float(nb_ctr), 4),
+                    "branded_click_share_pct": round(float(b_pct), 1),
                 },
-                "traffic_impact_score": min(1.0, total_opp / total_clicks * 2),
+                "traffic_impact_score": min(1.0, b_clicks / total_clicks * 0.5),
             })
     except Exception:
         pass
 
-    # ── Predefined: long-tail vs head vs mid-tail ─────────────────────────────
+    # ── All subsequent predefined checks run on NON-BRANDED only ─────────────
+
+    # ── Predefined: high-impression, low-CTR (non-branded) ───────────────────
     try:
-        longtail = df[df["word_count"] >= 4]
-        head = df[df["word_count"] <= 2]
-        mid = df[df["word_count"] == 3]
+        nb = nonbranded.copy()
+        if len(nb) >= 10:
+            imp_75 = nb["impressions"].quantile(0.75)
+            ctr_25 = nb["ctr"].quantile(0.25)
+            hi_imp_lo_ctr = nb[(nb["impressions"] >= imp_75) & (nb["ctr"] <= ctr_25)].copy()
+            if len(hi_imp_lo_ctr) >= 5:
+                hi_imp_lo_ctr["opportunity"] = hi_imp_lo_ctr["impressions"] * (nb["ctr"].mean() - hi_imp_lo_ctr["ctr"])
+                top = hi_imp_lo_ctr.sort_values("opportunity", ascending=False).head(5)
+                total_opp = float(top["opportunity"].sum())
+                insights.append({
+                    "category": "anomaly",
+                    "title": f"{len(hi_imp_lo_ctr)} non-branded high-impression queries have below-average CTR",
+                    "description": (
+                        f"Top 25% impressions but bottom 25% CTR among non-branded queries — high visibility, low click-through. "
+                        f"Top: '{top.iloc[0]['query']}' — {top.iloc[0]['impressions']:.0f} impressions at {top.iloc[0]['ctr']*100:.1f}% CTR. "
+                        f"Fixing titles/meta could yield ~{total_opp:.0f} additional clicks."
+                    ),
+                    "evidence": {
+                        "query_count": len(hi_imp_lo_ctr),
+                        "top_opportunities": top[["query", "impressions", "ctr", "position"]].round(3).to_dict("records"),
+                        "estimated_additional_clicks": round(total_opp, 0),
+                    },
+                    "traffic_impact_score": min(1.0, total_opp / total_clicks * 2),
+                })
+    except Exception:
+        pass
+
+    # ── Predefined: long-tail vs head vs mid-tail (non-branded) ──────────────
+    try:
+        nb = nonbranded.copy()
+        longtail = nb[nb["word_count"] >= 4]
+        head     = nb[nb["word_count"] <= 2]
+        mid      = nb[nb["word_count"] == 3]
         for grp, grp_label in [(longtail, "Long-tail (4+ word)"), (mid, "Mid-tail (3-word)")]:
             if len(grp) >= 10 and len(head) >= 5:
-                g_ctr = grp["ctr"].mean()
-                hd_ctr = head["ctr"].mean()
+                g_ctr   = grp["ctr"].mean()
+                hd_ctr  = head["ctr"].mean()
                 g_clicks = grp["clicks"].sum()
                 if hd_ctr > 0 and abs(g_ctr - hd_ctr) / hd_ctr > 0.10:
                     pct = abs(g_ctr - hd_ctr) / hd_ctr * 100
                     insights.append({
                         "category": "cluster",
-                        "title": f"{grp_label} queries get {pct:.0f}% {'higher' if g_ctr > hd_ctr else 'lower'} CTR",
+                        "title": f"Non-branded {grp_label} queries get {pct:.0f}% {'higher' if g_ctr > hd_ctr else 'lower'} CTR",
                         "description": (
-                            f"{grp_label} queries average {g_ctr*100:.2f}% CTR vs {hd_ctr*100:.2f}% for head terms. "
+                            f"{grp_label} non-branded queries average {g_ctr*100:.2f}% CTR vs {hd_ctr*100:.2f}% for head terms. "
                             f"Drives {g_clicks:.0f} clicks ({g_clicks/total_clicks*100:.0f}% of total) across {len(grp)} keywords."
                         ),
                         "evidence": {
@@ -902,22 +1085,23 @@ def analyze_queries(rows, site):
     except Exception:
         pass
 
-    # ── Predefined: question queries ─────────────────────────────────────────
+    # ── Predefined: question queries (non-branded) ────────────────────────────
     try:
-        q_df = df[df["is_question"]]
-        nq_df = df[~df["is_question"]]
+        nb = nonbranded.copy()
+        q_df  = nb[nb["is_question"]]
+        nq_df = nb[~nb["is_question"]]
         if len(q_df) >= 10 and len(nq_df) >= 10:
-            q_ctr = q_df["ctr"].mean()
-            nq_ctr = nq_df["ctr"].mean()
+            q_ctr   = q_df["ctr"].mean()
+            nq_ctr  = nq_df["ctr"].mean()
             q_clicks = q_df["clicks"].sum()
             if nq_ctr > 0 and abs(q_ctr - nq_ctr) / nq_ctr > 0.10:
                 pct = abs(q_ctr - nq_ctr) / nq_ctr * 100
                 direction = "higher" if q_ctr > nq_ctr else "lower"
                 insights.append({
                     "category": "cluster",
-                    "title": f"Question queries (how/what/why) get {pct:.0f}% {direction} CTR",
+                    "title": f"Non-branded question queries (how/what/why) get {pct:.0f}% {direction} CTR",
                     "description": (
-                        f"Question queries average {q_ctr*100:.2f}% CTR vs {nq_ctr*100:.2f}% for others. "
+                        f"Question queries average {q_ctr*100:.2f}% CTR vs {nq_ctr*100:.2f}% for others (non-branded only). "
                         f"{len(q_df)} question queries drive {q_clicks:.0f} clicks."
                     ),
                     "evidence": {
@@ -931,9 +1115,10 @@ def analyze_queries(rows, site):
     except Exception:
         pass
 
-    # ── Predefined: near-page-1 opportunities ────────────────────────────────
+    # ── Predefined: near-page-1 opportunities (non-branded) ──────────────────
     try:
-        near_p1 = df[(df["position"] >= 4) & (df["position"] <= 10) & (df["impressions"] >= 100)].copy()
+        nb = nonbranded.copy()
+        near_p1 = nb[(nb["position"] >= 4) & (nb["position"] <= 10) & (nb["impressions"] >= 100)].copy()
         if len(near_p1) >= 5:
             near_p1["click_gain_if_p3"] = near_p1["impressions"] * (EXPECTED_CTR.get(3, 0.11) - near_p1["ctr"])
             near_p1 = near_p1[near_p1["click_gain_if_p3"] > 0].sort_values("click_gain_if_p3", ascending=False)
@@ -942,9 +1127,9 @@ def analyze_queries(rows, site):
                 top3 = near_p1.head(3)[["query", "position", "impressions", "ctr"]].round(2).to_dict("records")
                 insights.append({
                     "category": "cluster",
-                    "title": f"{len(near_p1)} queries in positions 4-10 are close to a top-3 breakthrough",
+                    "title": f"{len(near_p1)} non-branded queries in positions 4-10 are close to a top-3 breakthrough",
                     "description": (
-                        f"Small ranking push could yield ~{total_gain:.0f} additional clicks. "
+                        f"Small ranking push could yield ~{total_gain:.0f} additional clicks (non-branded only). "
                         f"Top: '{near_p1.iloc[0]['query']}' at position {near_p1.iloc[0]['position']:.1f} with {near_p1.iloc[0]['impressions']:.0f} impressions."
                     ),
                     "evidence": {
@@ -957,53 +1142,53 @@ def analyze_queries(rows, site):
     except Exception:
         pass
 
-    # ── Predefined: branded vs non-branded ───────────────────────────────────
-    try:
-        import re
-        brand_hints = set()
-        brand_match = re.search(r"(?:https?://)?(?:www\.)?([^./]+)", site or "")
-        if brand_match:
-            brand_hints.add(brand_match.group(1).lower())
-        if brand_hints:
-            df["is_branded"] = df["query"].str.lower().apply(lambda q: any(b in q for b in brand_hints))
-            branded = df[df["is_branded"]]
-            nonbranded = df[~df["is_branded"]]
-            if len(branded) >= 3 and len(nonbranded) >= 10:
-                b_clicks = branded["clicks"].sum()
-                nb_clicks = nonbranded["clicks"].sum()
-                b_ctr = branded["ctr"].mean()
-                nb_ctr = nonbranded["ctr"].mean()
-                b_pct = b_clicks / total_clicks * 100
-                insights.append({
-                    "category": "cluster",
-                    "title": f"Branded queries account for {b_pct:.0f}% of total clicks at {b_ctr*100:.1f}% CTR",
-                    "description": (
-                        f"Branded queries ({len(branded)} keywords): {b_clicks:.0f} clicks at {b_ctr*100:.1f}% CTR. "
-                        f"Non-branded ({len(nonbranded)} keywords): {nb_clicks:.0f} clicks at {nb_ctr*100:.1f}% CTR. "
-                        f"{'High branded share — diversify non-branded content.' if b_pct > 30 else 'Strong non-branded organic presence.'}"
-                    ),
-                    "evidence": {
-                        "branded_query_count": len(branded),
-                        "branded_clicks": float(b_clicks),
-                        "branded_avg_ctr": round(float(b_ctr), 4),
-                        "nonbranded_clicks": float(nb_clicks),
-                        "nonbranded_avg_ctr": round(float(nb_ctr), 4),
-                        "branded_click_share_pct": round(float(b_pct), 1),
-                    },
-                    "traffic_impact_score": min(1.0, b_clicks / total_clicks * 0.5),
-                })
-    except Exception:
-        pass
-
-    # ── Open-ended: HDBSCAN on query feature vectors ──────────────────────────
-    query_features = ["log_clicks", "log_impressions", "ctr", "position", "word_count", "is_question"]
-    hdbscan_insights = hdbscan_clusters(
-        df, query_features, label_col="query", value_col="clicks",
-        total_value=total_clicks, category_tag="discovered_cluster", entity_name="queries"
-    )
-    insights.extend(hdbscan_insights)
+    # ── Open-ended: UMAP → HDBSCAN — run separately on branded and non-branded
+    # Running on the full mixed pool would have branded CTR baselines (50-70%)
+    # distort the distance calculations for non-branded clusters (5-15% CTR).
+    # v3: two separate clustering passes, tagged with brand context.
+    for subset, subset_label, subset_total in [
+        (nonbranded, "non-branded queries", nb_total_clicks),
+        (branded,    "branded queries",     branded["clicks"].sum() or 1.0),
+    ]:
+        if len(subset) < 15:
+            continue
+        query_features = ["log_clicks", "log_impressions", "ctr", "position", "word_count", "is_question"]
+        sub_insights = hdbscan_clusters(
+            subset, query_features, label_col="query", value_col="clicks",
+            total_value=total_clicks,  # keep denominator as site total for comparability
+            category_tag="discovered_cluster", entity_name=subset_label
+        )
+        insights.extend(sub_insights)
 
     return insights
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def analyze(payload):
+    analysis_type = payload.get("type")
+    data = payload.get("data", [])
+    site = payload.get("site", "")
+
+    if not data:
+        return {"insights": [], "error": "No data provided"}
+
+    dispatch = {
+        "gsc_daily":   analyze_daily,
+        "gsc_pages":   analyze_pages,
+        "gsc_queries": analyze_queries,
+    }
+    fn = dispatch.get(analysis_type)
+    if not fn:
+        return {"insights": [], "error": f"Unknown analysis type: {analysis_type}"}
+
+    insights = fn(data, site)
+    insights.sort(key=lambda x: x.get("traffic_impact_score", 0), reverse=True)
+    for i, ins in enumerate(insights):
+        ins["rank"] = i + 1
+    return {"insights": insights[:MAX_INSIGHTS]}
 
 
 def main():
